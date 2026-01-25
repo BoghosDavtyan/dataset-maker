@@ -33,7 +33,13 @@ WHISPERX_VAD_TRAIL_BUFFER_SEC = 0.2
 def load_whisperx_model(model_name="large-v2"):
     """Load and return the WhisperX model on CUDA (float16)."""
     asr_options = {"initial_prompt": '"No! We must not be pushed back," he replied back. "Keep on fighting to your very deaths!"'}
-    return whisperx.load_model(model_name, device="cuda", compute_type="float16", asr_options=asr_options)
+    return whisperx.load_model(
+        model_name,
+        device="cuda",
+        compute_type="float16",
+        asr_options=asr_options,
+        vad_method="silero",
+    )
 
 def run_whisperx_transcription(audio_path, output_dir, language="en", chunk_size=20, no_align=False, model=None, batch_size=16):
     print(f"DEBUG: Running WhisperX transcription on {audio_path}...")
@@ -60,8 +66,11 @@ def stitch_segments(segment_files, sr, silence_duration_sec=10):
     Stitch segments from the list of WAV files by concatenating their NumPy arrays with a silent gap in between.
     Returns the stitched NumPy array.
     """
-    # Sort files numerically (e.g. seg1.wav, seg2.wav, ...)
-    segment_files = sorted(segment_files, key=lambda x: int(x.stem.replace("seg", "")))
+    # Sort files numerically (e.g. seg_00000001.wav, seg_00000002.wav, ...)
+    segment_files = sorted(
+        segment_files,
+        key=lambda x: int(x.stem.replace("seg_", "").replace("seg", ""))
+    )
     
     # Load the first segment to determine shape
     first_data, _ = sf.read(str(segment_files[0]), dtype='float32')
@@ -244,7 +253,7 @@ def _slice_audio_with_silence(audio_file, model, subfolder, y, sr, silence_durat
                 continue
             print(f"DEBUG: Keeping short segment {i+1} (duration {duration:.3f} sec) due to verbose mode.")
 
-        seg_filename = subfolder / f"seg{current_index}.wav"
+        seg_filename = subfolder / f"seg_{current_index:08d}.wav"
         current_index += 1
         seg_durations.append(duration)
         sf.write(str(seg_filename), seg_to_write, sr)
@@ -364,7 +373,7 @@ def _slice_audio_with_whisperx(audio_file, subfolder, y, sr, model, language,
         else:
             seg_to_write = y[start_sample:end_sample]
 
-        seg_filename = subfolder / f"seg{current_index}.wav"
+        seg_filename = subfolder / f"seg_{current_index:08d}.wav"
         sf.write(str(seg_filename), seg_to_write, sr)
 
         transcript = segment.get("text", "")
@@ -453,7 +462,7 @@ def process_audio_file(audio_file, model, output_base, train_txt_path, silence_d
         for seg_path, transcript in segment_records:
             cleaned_transcript = transcript.strip()
             try:
-                seg_number = int(seg_path.stem.replace("seg", ""))
+                seg_number = int(seg_path.stem.replace("seg_", "").replace("seg", ""))
             except ValueError:
                 seg_number = seg_path.stem
 

@@ -1,61 +1,95 @@
 # Dataset Maker
-Multi-purpose dataset maker for various TTS models.
+Multi-purpose dataset maker for various TTS models:
 - Tortoise TTS/XTTS
 - StyleTTS 2 ~ [Webui](https://github.com/JarodMica/StyleTTS-WebUI)
 - Higgs Audio ~ [Base](https://github.com/JimmyMa99/train-higgs-audio) - [My fork](https://github.com/JarodMica/higgs-audio/tree/training)
 - VibeVoice ~ [Base](https://github.com/voicepowered-ai/VibeVoice-finetuning) - [My fork](https://github.com/JarodMica/VibeVoice-finetuning)
 - IndexTTS 2 ~ [My Trainer](https://github.com/JarodMica/index-tts/tree/training_v2)
 
-## What does it output?
-**Tortoise, StyleTTS2, XTTS** - Models like these take in a simple text file where audio:text pairs are sorted something like:
- - `path/to/audio/file | transcription`
- 
- **Folder Sturcutre**
- ```bash
-Dataset_name
-- train.txt
--- seg1.wav
--- seg2.wav
- ```
+## Main entrypoint
+The primary script is `gradio_interface.py`. It starts the Gradio UI that orchestrates
+project creation, audio uploads, transcription, and dataset export.
 
-**Higgs Audio** has a main metadata.json that includes all of the information and instructions for how to train on audio files, broken down by .txt files and .wav.
+## Quick start (Windows)
+1. Make sure you have Astral `uv` installed.
+2. Run:
+   ```bash
+   git clone https://github.com/JarodMica/dataset-maker.git
+   cd dataset-maker
+   uv sync
+   ```
+3. Launch the UI:
+   ```bash
+   uv run .\gradio_interface.py
+   ```
 
-**Folder Structure**
-```bash
-Dataset_name
-- metadata.json
-- some_audio_1.txt
-- some_audio_1.wav
-- some_audio_2.txt
-- some_audio_2.wav
+## Core workflow
+1. Create a project in the UI (creates `datasets_folder/<project>`).
+2. Upload audio into `wavs/`.
+3. Optionally combine short clips into longer files for faster transcription.
+4. Transcribe using:
+   - Silence slicer (local slicer)
+   - WhisperX timestamps (Silero VAD hardcoded for pyannote 4.0 compatibility)
+   - Emilia pipe (full multi-stage pipeline)
+5. Review/correct transcripts and export to the target dataset format.
+
+## Outputs
+Below are examples based on the export code in `gradio_interface.py`.
+
+**Base (Tortoise/XTTS)** exports a `train.txt` with `file_id | transcript` and a `wavs/` folder:
+```
+train.txt
+seg000001.wav|Hello world.
+seg000002.wav|Another line.
 ```
 
-**Vibe Voice** has a main `.jsonl` file that contains individual json entries with text and audio keys. It always prepends "Speaker 0: " before each transcription in accordance with what the trainer is expecting.
- - `{"text": "Speaker 0: some transcription", "audio": "path/to/audio"}`
-
-**Folder Structure**
-```bash
-Dataset_name
-- <project_name>_train.jsonl
-- vibevoice_000000.wav
-- vibevoice_000001.wav
+**StyleTTS** format (from the Adjust train.txt tab) adds a speaker tag:
+```
+train.txt
+seg000001.wav|Hello world.|speaker_01
 ```
 
-## Installation (Windows)
-1. Make sure you have astral uv installed on your PC
-2. Run the following:
-    ```bash
-    git clone https://github.com/JarodMica/dataset-maker.git
-    cd dataset-maker
-    uv sync
-    ```
-3. uv should handle the installation of all packages and versioning. Once it finishes running, launch the gradio with:
-    ```
-    uv run .\gradio_interface.py
-    ```
+**GPTSoVITS** format (from the Adjust train.txt tab) adds slicer_opt + language:
+```
+train.txt
+seg000001.wav|slicer_opt|en|Hello world.
+```
+
+**Higgs Audio** export writes per-sample files and `metadata.json`:
+```
+speaker_01_000000.wav
+speaker_01_000000.txt
+metadata.json
+```
+`metadata.json` entries include speaker and quality fields (e.g. `speaker_id`, `gender`, `duration`, `quality_score`).
+
+**VibeVoice** export writes a JSONL manifest with a "Speaker 0: " prefix:
+```
+{"text":"Speaker 0: Hello world.","audio":"<dataset_folder>/vibevoice_000000.wav"}
+```
+
+**Qwen 3 TTS** export writes a JSONL manifest with audio + ref_audio paths (relative to the export folder). Audio files are copied from the transcribe outputs into `data/` (prefixed if collisions), and the reference clip is copied as `data/ref_audio.<ext>`:
+```
+{"audio":"./data/seg_00000001.wav","text":"Hello world.","ref_audio":"./data/ref_audio.wav"}
+```
+In the UI, the Qwen 3 TTS reference audio picker lists files from the project's `transcribe/` folder.
+Selecting the Qwen 3 TTS export format refreshes the reference list and resets to the first available item.
+
+**Emilia pipe (Originally intended for IndexTTS 2, not exclusive)** writes a project-scoped JSONL and audio folder:
+```
+{"id":"<clip_id>","text":"Hello world.","audio":"<project>_emilia_dataset/audio/<clip_id>.mp3","speaker":"<base>_SPEAKER_X","language":"en","duration":1.23,"source":"original.wav"}
+```
+
+## Emilia configuration
+The Emilia path in the UI expects `Emilia/config.json`. Copy
+`Emilia/config_example.json` to `Emilia/config.json` and update:
+- `huggingface_token`
+- `entrypoint.input_folder_path` (optional override from UI)
+- model paths in `separate.step1.model_path` and `mos_model.primary_model_path`
 
 ## Onnx Runtime Issue CUDA
-CUDAExecution provider may not be found even when using uv. The fix for this is to remove and then add `optimum[onnxruntime-gpu]` in the terminal
+CUDAExecution provider may not be found even when using uv. The fix is to remove
+and then add `optimum[onnxruntime-gpu]` in the terminal.
 
 ### Problematic
 ```
@@ -73,3 +107,6 @@ uv run python
 Available providers: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
 ```
 
+## More documentation
+See `docs/CONFIG.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, and
+`docs/TROUBLESHOOTING.md` for details.

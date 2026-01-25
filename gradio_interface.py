@@ -81,6 +81,31 @@ def list_audio_files(project: str):
     audio_files = [f.name for f in wavs_folder.iterdir() if f.suffix.lower() in VALID_AUDIO_EXTENSIONS]
     return audio_files
 
+def list_ref_audio_files(project: str):
+    if not project:
+        return []
+    project_base = DATASETS_FOLDER / project
+    transcribe_folder = project_base / "transcribe"
+    if not transcribe_folder.exists():
+        return []
+    audio_files = [
+        str(f.relative_to(transcribe_folder)).replace("\\", "/")
+        for f in transcribe_folder.rglob("*")
+        if f.is_file() and f.suffix.lower() in VALID_AUDIO_EXTENSIONS
+    ]
+    audio_files.sort()
+    return audio_files
+
+def get_ref_audio_path(project: str, ref_audio_name: str):
+    if not project or not ref_audio_name:
+        return None
+    project_base = DATASETS_FOLDER / project
+    transcribe_folder = project_base / "transcribe"
+    ref_audio_path = transcribe_folder / ref_audio_name
+    if not ref_audio_path.exists():
+        return None
+    return str(ref_audio_path)
+
 def load_train_txt(project: str):
     if not project:
         return "No project selected."
@@ -111,7 +136,7 @@ def load_train_with_prefix(project: str):
 # NEW FUNCTION: Combine Transcribe Folders into One Dataset Folder
 # =============================================================================
 def export_dataset(project: str, export_format: str = "Base", speaker_id: str = "", gender: str = "unknown",
-                   vibevoice_jsonl_name: str = ""):
+                   vibevoice_jsonl_name: str = "", qwen_ref_audio_name: str = ""):
     """
     Combine all folders (and any files directly inside) in the project's 'transcribe'
     folder into export-format-specific dataset structures.
@@ -150,6 +175,22 @@ def export_dataset(project: str, export_format: str = "Base", speaker_id: str = 
             transcribe_folder=transcribe_folder,
             train_text_path=train_text_path,
             jsonl_name=vibevoice_jsonl_name.strip(),
+        )
+
+    if export_format in ["qwen 3 tts", "qwen3 tts", "qwen3tts", "qwen_3_tts", "qwen3_tts"]:
+        if not qwen_ref_audio_name.strip():
+            return "Reference audio is required for Qwen 3 TTS export."
+        target_folder = project_base / f"{project}_qwen3_tts_dataset"
+        try:
+            target_folder.mkdir(parents=True, exist_ok=False)
+        except:
+            raise gr.Error(f"Please remove existing exported Qwen 3 TTS dataset folder inside of {project} and try again.")
+        return export_qwen3_tts_format(
+            project=project,
+            target_folder=target_folder,
+            transcribe_folder=transcribe_folder,
+            train_text_path=train_text_path,
+            ref_audio_name=qwen_ref_audio_name.strip(),
         )
 
     # Base export
@@ -360,6 +401,84 @@ def export_vibevoice_format(project: str, target_folder, transcribe_folder, trai
             f.write("\n")
 
     return f"Exported {len(entries)} files in Vibevoice format to '{target_folder.name}' with {jsonl_path.name}"
+
+def export_qwen3_tts_format(project: str, target_folder, transcribe_folder, train_text_path, ref_audio_name: str):
+    """
+    Export dataset in Qwen 3 TTS format:
+    - data/ folder of audio files (copied from transcribe)
+    - JSONL file with {"audio": "./data/file.wav", "text": "...", "ref_audio": "./data/ref_audio.wav"}
+    """
+    import json
+    import posixpath
+
+    if not train_text_path.exists():
+        return "train.txt file not found. Please generate transcription first."
+
+    project_base = DATASETS_FOLDER / project
+    ref_audio_source = project_base / "transcribe" / ref_audio_name
+    if not ref_audio_source.exists():
+        return f"Reference audio not found: {ref_audio_name}"
+
+    transcript_map = {}
+    with open(train_text_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '|' in line:
+                filename, transcript = line.strip().split('|', 1)
+                transcript_map[filename.strip()] = transcript.strip()
+
+    audio_files = [
+        f for f in transcribe_folder.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in VALID_AUDIO_EXTENSIONS
+        and "stitched" not in f.name
+    ]
+
+    if not audio_files:
+        return "No audio files found for export."
+
+    audio_files.sort(key=lambda x: x.name)
+
+    data_folder = target_folder / "data"
+    data_folder.mkdir(parents=True, exist_ok=True)
+
+    ref_audio_target_name = f"ref_audio{ref_audio_source.suffix.lower()}"
+    ref_audio_target_path = data_folder / ref_audio_target_name
+    shutil.copy(str(ref_audio_source), str(ref_audio_target_path))
+
+    entries = []
+    skipped_missing = 0
+    for audio_file in audio_files:
+        target_name = audio_file.name
+        if target_name == ref_audio_target_name or (data_folder / target_name).exists():
+            target_name = f"sample_{target_name}"
+        target_audio_path = data_folder / target_name
+        shutil.copy(str(audio_file), str(target_audio_path))
+
+        original_filename = audio_file.name
+        transcript = transcript_map.get(original_filename, "")
+        if not transcript:
+            name_without_ext = audio_file.stem
+            transcript = transcript_map.get(name_without_ext, "")
+        if not transcript:
+            skipped_missing += 1
+            continue
+
+        audio_rel_path = posixpath.join(".", "data", target_name)
+        ref_audio_rel_path = posixpath.join(".", "data", ref_audio_target_name)
+        entries.append({"audio": audio_rel_path, "text": transcript.strip(), "ref_audio": ref_audio_rel_path})
+
+    jsonl_path = target_folder / "train.jsonl"
+    with open(jsonl_path, 'w', encoding='utf-8') as f:
+        for entry in entries:
+            json.dump(entry, f, ensure_ascii=False)
+            f.write("\n")
+
+    if skipped_missing:
+        return (
+            f"Exported {len(entries)} files in Qwen 3 TTS format to '{target_folder.name}' "
+            f"with {jsonl_path.name}. Skipped {skipped_missing} files missing transcripts."
+        )
+    return f"Exported {len(entries)} files in Qwen 3 TTS format to '{target_folder.name}' with {jsonl_path.name}"
 
 # =============================================================================
 # NEW FUNCTION: Combine All Audio Samples (with batching and multiprocessing)
@@ -1400,7 +1519,7 @@ def setup_gradio():
                 gr.Markdown("### Export All Transcribe Folders into a Single Dataset Folder")
                 gr.Markdown("This will copy all files from subfolders (and files directly in the folder) of the project's 'transcribe' folder into a single folder named '<project>_dataset'.")
                 
-                export_format_dropdown = gr.Dropdown(label="Export Format", choices=["Base", "Higgs", "Vibevoice"], value="Base")
+                export_format_dropdown = gr.Dropdown(label="Export Format", choices=["Base", "Higgs", "Vibevoice", "Qwen 3 TTS"], value="Base")
 
                 with gr.Row(visible=False) as higgs_options:
                     speaker_id_input = gr.Textbox(label="Speaker ID", placeholder="e.g., alma_speaker, melina_speaker", info="Used for Higgs format file naming", scale=2)
@@ -1409,26 +1528,68 @@ def setup_gradio():
                 with gr.Row(visible=False) as vibevoice_options:
                     vibevoice_jsonl_input = gr.Textbox(label="JSONL Name", placeholder="e.g., vibevoice_train", info="Filename (without extension) for the JSONL manifest", scale=2)
 
+                with gr.Row(visible=False) as qwen3_options:
+                    qwen3_ref_audio_dropdown = gr.Dropdown(label="Reference Audio", choices=[], scale=2)
+                    qwen3_ref_audio_preview = gr.Audio(label="Reference Audio Preview", type="filepath", scale=3)
+
                 export_dataset_button = gr.Button("Export Dataset")
                 export_dataset_status = gr.Textbox(label="Status", lines=2)
                 
-                def update_export_options(format_choice):
+                def update_export_options(format_choice, project):
                     is_higgs = format_choice == "Higgs"
                     is_vibevoice = format_choice == "Vibevoice"
+                    is_qwen3 = format_choice == "Qwen 3 TTS"
+                    ref_audio_update = gr.update()
+                    ref_preview = None
+                    if is_qwen3:
+                        choices = list_ref_audio_files(project)
+                        value = choices[0] if choices else None
+                        ref_audio_update = gr.update(choices=choices, value=value)
+                        ref_preview = get_ref_audio_path(project, value) if value else None
                     return (
                         gr.update(visible=is_higgs),
                         gr.update(visible=is_vibevoice),
+                        gr.update(visible=is_qwen3),
+                        ref_audio_update,
+                        ref_preview,
                     )
+
+                def update_qwen3_ref_audio(project):
+                    choices = list_ref_audio_files(project)
+                    value = choices[0] if choices else None
+                    preview_path = get_ref_audio_path(project, value) if value else None
+                    return gr.update(choices=choices, value=value), preview_path
+
+                def update_qwen3_preview(project, ref_audio_name):
+                    return get_ref_audio_path(project, ref_audio_name)
                 
                 export_format_dropdown.change(
                     fn=update_export_options,
-                    inputs=export_format_dropdown,
-                    outputs=[higgs_options, vibevoice_options],
+                    inputs=[export_format_dropdown, projects_dropdown],
+                    outputs=[
+                        higgs_options,
+                        vibevoice_options,
+                        qwen3_options,
+                        qwen3_ref_audio_dropdown,
+                        qwen3_ref_audio_preview,
+                    ],
+                )
+
+                projects_dropdown.change(
+                    fn=update_qwen3_ref_audio,
+                    inputs=projects_dropdown,
+                    outputs=[qwen3_ref_audio_dropdown, qwen3_ref_audio_preview],
+                )
+
+                qwen3_ref_audio_dropdown.change(
+                    fn=update_qwen3_preview,
+                    inputs=[projects_dropdown, qwen3_ref_audio_dropdown],
+                    outputs=qwen3_ref_audio_preview,
                 )
                 
                 export_dataset_button.click(
                     fn=export_dataset,
-                    inputs=[projects_dropdown, export_format_dropdown, speaker_id_input, gender_dropdown, vibevoice_jsonl_input],
+                    inputs=[projects_dropdown, export_format_dropdown, speaker_id_input, gender_dropdown, vibevoice_jsonl_input, qwen3_ref_audio_dropdown],
                     outputs=export_dataset_status,
                 )
 
