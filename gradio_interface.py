@@ -842,7 +842,9 @@ def transcribe_interface(project: str, language, silence_duration, purge_long_se
                          slice_method_label="Silence Slicer",
                          emilia_batch_size=16, emilia_whisper_arch="medium",
                          emilia_do_uvr=True, emilia_threads=4, emilia_min_duration=0.25,
-                         emilia_hash_names: bool = False, emilia_keep_processed: bool = True):
+                         emilia_hash_names: bool = False, emilia_keep_processed: bool = True,
+                         qwen_model_path: str = "OzLabs/Caspi-1.7B", qwen_language: str = "Hebrew", 
+                         qwen_batch_size: int = 16, qwen_context: str = ""):
     if not project:
         return "No project selected."
     
@@ -992,10 +994,15 @@ def transcribe_interface(project: str, language, silence_duration, purge_long_se
             return "No valid audio files found in the 'wavs' folder."
 
     try:
-        model = transcriber.load_whisperx_model("large-v3")
-        
         logger.info(f"Starting transcription using slice method '{slice_method}'.")
         
+        if slice_method == transcriber.QWEN_SILENCE_METHOD:
+            model = transcriber.load_qwen_model(model_path=qwen_model_path, batch_size=int(qwen_batch_size))
+            transcribe_language = qwen_language
+        else:
+            model = transcriber.load_whisperx_model("large-v3")
+            transcribe_language = language
+            
         for i, audio_file in enumerate(audio_files, 1):
             logger.info(f"Processing file {i}/{len(audio_files)}: {audio_file.name}")
             
@@ -1004,14 +1011,15 @@ def transcribe_interface(project: str, language, silence_duration, purge_long_se
                 model=model,
                 output_base=transcribe_folder,
                 train_txt_path=train_txt_path,
-                    silence_duration_sec=silence_duration,
-                    purge_long_segments=purge_long_segments,
-                    max_segment_length=max_segment_length,
-                    verbose_mode=verbose_mode,
-                    starting_index=starting_index,
-                    language=language,
-                    slice_method=slice_method
-                )
+                silence_duration_sec=silence_duration,
+                purge_long_segments=purge_long_segments,
+                max_segment_length=max_segment_length,
+                verbose_mode=verbose_mode,
+                starting_index=starting_index,
+                language=transcribe_language,
+                slice_method=slice_method,
+                qwen_context=qwen_context
+            )
     
         if train_txt_path.exists():
             with open(train_txt_path, "r", encoding="utf-8") as f:
@@ -1271,6 +1279,20 @@ def setup_gradio():
                         value=DEFAULT_SLICE_METHOD_LABEL,
                         interactive=True,
                     )
+                
+                qwen_options = gr.Group(visible=True)
+                with qwen_options:
+                    gr.Markdown("### Qwen3-ASR Settings")
+                    with gr.Row():
+                        qwen_model_path = gr.Textbox(label="Model Repo/Path", value="OzLabs/Caspi-1.7B")
+                        qwen_language = gr.Textbox(label="Qwen Language (Spell it out)", value="Hebrew", info="E.g., Hebrew, English, Chinese")
+                        qwen_batch_size = gr.Slider(label="Batch Size", minimum=1, maximum=64, step=1, value=16)
+                    qwen_context = gr.Textbox(
+                        label="System Context (Instruction)", 
+                        value="אנא כתוב מספרים במילים. לדוגמה: אחת, שתיים, שלוש.",
+                        lines=2
+                    )
+
                 with gr.Row():
                     silence_duration = gr.Slider(
                         label="Silence Duration (seconds)",
@@ -1328,17 +1350,19 @@ def setup_gradio():
 
                 def _update_slice_controls(label):
                     method = SLICE_METHOD_OPTIONS.get(label, str(label).lower())
-                    silence_enabled = method == transcriber.SILENCE_SLICE_METHOD
+                    silence_enabled = method in [transcriber.SILENCE_SLICE_METHOD, transcriber.QWEN_SILENCE_METHOD]
                     emilia_visible = method == transcriber.EMILIA_PIPE_METHOD
+                    qwen_visible = method == transcriber.QWEN_SILENCE_METHOD
                     return (
                         gr.update(interactive=silence_enabled),
                         gr.update(visible=emilia_visible),
+                        gr.update(visible=qwen_visible)
                     )
 
                 slice_method_dropdown.change(
                     fn=_update_slice_controls,
                     inputs=slice_method_dropdown,
-                    outputs=[silence_duration, emilia_options],
+                    outputs=[silence_duration, emilia_options, qwen_options],
                 )
                 with gr.Row():
                     purge_checkbox = gr.Checkbox(label="Purge segments longer than threshold", value=False)
@@ -1353,22 +1377,26 @@ def setup_gradio():
                 transcribe_output = gr.Textbox(label="train.txt Content", lines=10)
                 
                 transcribe_button.click(
-                    fn=lambda proj, lang, silence, purge, max_len, verbose, slice_choice, em_batch, em_whisper, em_uvr, em_threads, em_min_dur, em_hash, em_keep: transcribe_interface(
+                    fn=lambda proj, lang, silence, purge, max_len, verbose, slice_choice, em_batch, em_whisper, em_uvr, em_threads, em_min_dur, em_hash, em_keep, qwen_mod, qwen_lang, qwen_batch, qwen_ctx: transcribe_interface(
                         proj,
                         lang,
                         silence,
                         purge,
                         max_len,
                         verbose,
-                        resume_mode=False,
-                        slice_method_label=slice_choice,
-                        emilia_batch_size=em_batch,
-                        emilia_whisper_arch=em_whisper,
-                        emilia_do_uvr=em_uvr,
-                        emilia_threads=em_threads,
-                        emilia_min_duration=em_min_dur,
-                        emilia_hash_names=em_hash,
-                        emilia_keep_processed=em_keep
+                        False, # resume_mode
+                        slice_choice,
+                        em_batch,
+                        em_whisper,
+                        em_uvr,
+                        em_threads,
+                        em_min_dur,
+                        em_hash,
+                        em_keep,
+                        qwen_mod,
+                        qwen_lang,
+                        qwen_batch,
+                        qwen_ctx
                     ),
                     inputs=[
                         projects_dropdown,
@@ -1384,27 +1412,35 @@ def setup_gradio():
                         emilia_threads_slider,
                         emilia_min_duration_state,
                         emilia_hash_checkbox,
-                        emilia_keep_checkbox
+                        emilia_keep_checkbox,
+                        qwen_model_path,
+                        qwen_language,
+                        qwen_batch_size,
+                        qwen_context
                     ],
                     outputs=transcribe_output,
                 )
                 resume_button.click(
-                    fn=lambda proj, lang, silence, purge, max_len, verbose, slice_choice, em_batch, em_whisper, em_uvr, em_threads, em_min_dur, em_hash, em_keep: transcribe_interface(
+                    fn=lambda proj, lang, silence, purge, max_len, verbose, slice_choice, em_batch, em_whisper, em_uvr, em_threads, em_min_dur, em_hash, em_keep, qwen_mod, qwen_lang, qwen_batch, qwen_ctx: transcribe_interface(
                         proj,
                         lang,
                         silence,
                         purge,
                         max_len,
                         verbose,
-                        resume_mode=True,
-                        slice_method_label=slice_choice,
-                        emilia_batch_size=em_batch,
-                        emilia_whisper_arch=em_whisper,
-                        emilia_do_uvr=em_uvr,
-                        emilia_threads=em_threads,
-                        emilia_min_duration=em_min_dur,
-                        emilia_hash_names=em_hash,
-                        emilia_keep_processed=em_keep
+                        True, # resume_mode
+                        slice_choice,
+                        em_batch,
+                        em_whisper,
+                        em_uvr,
+                        em_threads,
+                        em_min_dur,
+                        em_hash,
+                        em_keep,
+                        qwen_mod,
+                        qwen_lang,
+                        qwen_batch,
+                        qwen_ctx
                     ),
                     inputs=[
                         projects_dropdown,
@@ -1420,7 +1456,11 @@ def setup_gradio():
                         emilia_threads_slider,
                         emilia_min_duration_state,
                         emilia_hash_checkbox,
-                        emilia_keep_checkbox
+                        emilia_keep_checkbox,
+                        qwen_model_path,
+                        qwen_language,
+                        qwen_batch_size,
+                        qwen_context
                     ],
                     outputs=transcribe_output,
                 )
@@ -1640,10 +1680,10 @@ if __name__ == "__main__":
     VALID_AUDIO_EXTENSIONS = [".wav", ".mp3", ".m4a", ".opus", ".webm", ".mp4", ".ogg"]
     WHISPER_LANGUAGES = ["af","am","ar","as","az","ba","be","bg","bn","bo","br","bs","ca","cs","cy","da","de","el","en","es","et","eu","fa","fi","fo","fr","gl","gu","ha","haw","he","hi","hr","ht","hu","hy","id","is","it","ja","jw","ka","kk","km","kn","ko","la","lb","ln","lo","lt","lv","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","nl","nn","no","oc","pa","pl","ps","pt","ro","ru","sa","sd","si","sk","sl","sn","so","sq","sr","su","sv","sw","ta","te","tg","th","tk","tl","tr","tt","uk","ur","uz","vi","yi","yo","yue","zh"]
     SLICE_METHOD_OPTIONS = {
+        "Qwen3-ASR (Silence Slicer)": transcriber.QWEN_SILENCE_METHOD,
         "WhisperX Timestamps": transcriber.WHISPERX_SLICE_METHOD,
         "Silence Slicer": transcriber.SILENCE_SLICE_METHOD,
         "Emilia Pipe": transcriber.EMILIA_PIPE_METHOD,
-        
     }
-    DEFAULT_SLICE_METHOD_LABEL = "WhisperX Timestamps"
+    DEFAULT_SLICE_METHOD_LABEL = "Qwen3-ASR (Silence Slicer)"
     main()
