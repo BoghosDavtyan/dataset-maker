@@ -19,7 +19,8 @@ from slicer2 import Slicer
 SILENCE_SLICE_METHOD = "silence"
 WHISPERX_SLICE_METHOD = "whisperx"
 EMILIA_PIPE_METHOD = "emilia_pipe"
-VALID_SLICE_METHODS = {SILENCE_SLICE_METHOD, WHISPERX_SLICE_METHOD, EMILIA_PIPE_METHOD}
+QWEN_SILENCE_METHOD = "qwen_silence"
+VALID_SLICE_METHODS = {SILENCE_SLICE_METHOD, WHISPERX_SLICE_METHOD, EMILIA_PIPE_METHOD, QWEN_SILENCE_METHOD}
 
 # WhisperX VAD refinement defaults
 WHISPERX_VAD_WINDOW_SEC = 0.03  # 30ms
@@ -29,6 +30,20 @@ WHISPERX_VAD_MAX_EXPAND_SEC = 0.4
 WHISPERX_VAD_SILENCE_FRAMES = 2
 WHISPERX_VAD_MIN_GAP_SEC = 0.02
 WHISPERX_VAD_TRAIL_BUFFER_SEC = 0.2
+
+def load_qwen_model(model_path="OzLabs/Caspi-1.7B", batch_size=16):
+    """Load and return the Qwen3-ASR model on CUDA (bfloat16)."""
+    import torch
+    from qwen_asr import Qwen3ASRModel
+    print(f"DEBUG: Loading Qwen3ASR model from {model_path}...")
+    model = Qwen3ASRModel.from_pretrained(
+        model_path,
+        dtype=torch.bfloat16,
+        device_map="cuda:0",
+        max_inference_batch_size=batch_size,
+        max_new_tokens=256
+    )
+    return model
 
 def load_whisperx_model(model_name="large-v2"):
     """Load and return the WhisperX model on CUDA (float16)."""
@@ -132,7 +147,6 @@ def map_srt_to_segments(srt_file, seg_boundaries):
         print(f"DEBUG: Final transcript for segment {idx+1}: {transcript}")
     return transcripts
 
-
 def _compute_rms_envelope(samples, sr):
     frame_length = max(int(round(WHISPERX_VAD_WINDOW_SEC * sr)), 1)
     hop_length = max(int(round(WHISPERX_VAD_HOP_SEC * sr)), 1)
@@ -143,7 +157,6 @@ def _compute_rms_envelope(samples, sr):
     rms = np.maximum(rms, 1e-8)
     rms_db = librosa.amplitude_to_db(rms)
     return times, rms_db
-
 
 def _refine_segment_boundaries(start, end, prev_end, next_start, rms_times, rms_db, audio_duration):
     if rms_times.size == 0:
@@ -220,6 +233,69 @@ def _refine_segment_boundaries(start, end, prev_end, next_start, rms_times, rms_
             refined_end = min(refined_end, max(next_start - WHISPERX_VAD_MIN_GAP_SEC, refined_start))
 
     return refined_start, refined_end
+
+def _slice_audio_with_qwen_and_silence(audio_file, model, subfolder, y, sr,
+                                       slicer_params, purge_long_segments, max_segment_length,
+                                       verbose_mode, starting_index, language, context_prompt):
+    print("DEBUG: Using silence-based slicing with Qwen3-ASR batching.")
+    slicer = Slicer(**slicer_params)
+
+    print("DEBUG: Slicing audio...")
+    segments_np = slicer.slice(y)
+    if not segments_np:
+        print(f"DEBUG: No segments found for {audio_file}. Skipping.")
+        return [], starting_index
+
+    segment_files = []
+    current_index = starting_index
+    
+    # 1. Save all valid segments to disk first
+    for i, seg in enumerate(segments_np):
+        if seg.ndim > 1:
+            duration = seg.shape[1] / sr
+            seg_to_write = seg.T
+        else:
+            duration = len(seg) / sr
+            seg_to_write = seg
+
+        if purge_long_segments and (duration > max_segment_length):
+            print(f"DEBUG: Skipping segment {i+1} because duration {duration:.3f} sec exceeds max allowed {max_segment_length} sec.")
+            continue
+        if duration < 1:
+            if not verbose_mode:
+                print(f"DEBUG: Skipping segment {i+1} because duration {duration:.3f} sec is less than 1 sec.")
+                continue
+            print(f"DEBUG: Keeping short segment {i+1} (duration {duration:.3f} sec) due to verbose mode.")
+
+        seg_filename = subfolder / f"seg_{current_index:08d}.wav"
+        sf.write(str(seg_filename), seg_to_write, sr)
+        segment_files.append((str(seg_filename), current_index))
+        print(f"DEBUG: Saved segment {current_index} to {seg_filename} with duration {duration:.3f} sec")
+        current_index += 1
+
+    if not segment_files:
+        print(f"DEBUG: No segments remaining after purging for {audio_file}. Skipping transcription.")
+        return [], current_index
+
+    # 2. Transcribe using Qwen's native batching
+    print(f"DEBUG: Transcribing {len(segment_files)} segments as a batch with Qwen...")
+    file_paths = [f[0] for f in segment_files]
+    
+    # Run batch inference
+    results = model.transcribe(
+        audio=file_paths,
+        language=language, 
+        context=context_prompt
+    )
+
+    # 3. Pair results back to files
+    segment_records = []
+    for (filepath, seg_idx), result in zip(segment_files, results):
+        transcript = result.text.strip()
+        segment_records.append((Path(filepath), transcript))
+        print(f"DEBUG: Segment {Path(filepath).name} transcribed: {transcript}")
+
+    return segment_records, current_index
 
 def _slice_audio_with_silence(audio_file, model, subfolder, y, sr, silence_duration_sec,
                               slicer_params, purge_long_segments, max_segment_length,
@@ -392,7 +468,8 @@ def process_audio_file(audio_file, model, output_base, train_txt_path, silence_d
                        slicer_params=None, purge_long_segments=False, max_segment_length=12,
                        verbose_mode=False,
                        starting_index=1, language="en",
-                       slice_method=SILENCE_SLICE_METHOD, chunk_size=8, batch_size=16):
+                       slice_method=SILENCE_SLICE_METHOD, chunk_size=8, batch_size=16,
+                       qwen_context=""):
     """
     Process one audio file using the requested slicing method.
     
@@ -417,11 +494,27 @@ def process_audio_file(audio_file, model, output_base, train_txt_path, silence_d
 
     method = (slice_method or SILENCE_SLICE_METHOD).lower()
     if method not in VALID_SLICE_METHODS:
-        print(f"DEBUG: Unknown slice method '{slice_method}'. Falling back to silence slicer.")
-        method = SILENCE_SLICE_METHOD
+        print(f"DEBUG: Unknown slice method '{slice_method}'. Falling back to Qwen Silence slicer.")
+        method = QWEN_SILENCE_METHOD
     if method == EMILIA_PIPE_METHOD:
         raise ValueError("Emilia Pipe slicing is handled externally via the Emilia pipeline.")
-    if method == SILENCE_SLICE_METHOD:
+        
+    if method == QWEN_SILENCE_METHOD:
+        segment_records, next_index = _slice_audio_with_qwen_and_silence(
+            audio_file=audio_file,
+            model=model,
+            subfolder=subfolder,
+            y=y,
+            sr=sr,
+            slicer_params=slicer_params,
+            purge_long_segments=purge_long_segments,
+            max_segment_length=max_segment_length,
+            verbose_mode=verbose_mode,
+            starting_index=starting_index,
+            language=language,
+            context_prompt=qwen_context
+        )
+    elif method == SILENCE_SLICE_METHOD:
         segment_records, next_index = _slice_audio_with_silence(
             audio_file=audio_file,
             model=model,
@@ -498,8 +591,8 @@ def main():
     # Define the path to the dataset file (train.txt)
     train_txt_path = output_base / "train.txt"
     
-    print("DEBUG: Loading WhisperX model (large-v3)...")
-    model = load_whisperx_model("large-v3")
+    print("DEBUG: Loading Qwen3ASR model...")
+    model = load_qwen_model()
     
     audio_extensions = (".wav", ".mp3", ".m4a", ".opus", ".webm", ".mp4")
     segment_counter = 1  # Global counter for segments across all files.
@@ -507,7 +600,8 @@ def main():
         if audio_file.suffix.lower() in audio_extensions:
             try:
                 segment_counter = process_audio_file(audio_file, model, output_base, train_txt_path,
-                                                       silence_duration_sec=3, starting_index=segment_counter)
+                                                       silence_duration_sec=3, starting_index=segment_counter,
+                                                       slice_method=QWEN_SILENCE_METHOD)
             except Exception as e:
                 print(f"DEBUG: Error processing {audio_file}: {e}")
             gc.collect()
