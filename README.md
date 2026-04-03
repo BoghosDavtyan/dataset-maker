@@ -18,7 +18,11 @@ project creation, audio uploads, transcription, and dataset export.
    cd dataset-maker
    uv sync
    ```
-3. Launch the UI:
+3. Because `flash-attn` requires specific build isolation flags to compile properly, run this manually:
+   ```bash
+   uv pip install flash-attn --no-build-isolation
+   ```
+4. Launch the UI:
    ```bash
    uv run .\gradio_interface.py
    ```
@@ -28,8 +32,9 @@ project creation, audio uploads, transcription, and dataset export.
 2. Upload audio into `wavs/`.
 3. Optionally combine short clips into longer files for faster transcription.
 4. Transcribe using:
-   - Silence slicer (local slicer)
+   - **Qwen3-ASR (Silence Slicer)**: The new default. Uses `OzLabs/Caspi-1.7B` with GPU batching for lightning-fast transcription and automatic number spelling.
    - WhisperX timestamps (Silero VAD hardcoded for pyannote 4.0 compatibility)
+   - Silence slicer (local slicer + WhisperX)
    - Emilia pipe (full multi-stage pipeline)
 5. Review/correct transcripts and export to the target dataset format.
 
