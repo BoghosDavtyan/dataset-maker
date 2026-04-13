@@ -13,6 +13,29 @@ import safe_globals  # Ensure torch safe globals are registered before model des
 import gc
 import time
 
+import re
+import phonemizer
+
+g2p_model = None
+LATIN_WORD_RE = re.compile(r'[a-zA-Z]+')
+
+def to_hebrew_ipa(text: str) -> str:
+    global g2p_model
+    if g2p_model is None:
+        from renikud_onnx import G2P
+        import espeakng_loader
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+        EspeakWrapper.set_library(espeakng_loader.get_library_path())
+        EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
+        g2p_model = G2P("renikud.onnx")
+        
+    def replace_latin(m: re.Match) -> str:
+        return phonemizer.phonemize(m.group(0), backend="espeak", language="en-us", strip=True, with_stress=True).strip()
+    
+    mixed_processed = LATIN_WORD_RE.sub(replace_latin, text)
+    ipa_text = g2p_model.phonemize(mixed_processed)
+    return re.sub(r"\s+", " ", ipa_text).strip()
+
 # Import the Slicer class from slicer2.py
 from slicer2 import Slicer
 
