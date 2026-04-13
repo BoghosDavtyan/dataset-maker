@@ -577,6 +577,14 @@ def process_audio_file(audio_file, model, output_base, train_txt_path, silence_d
     with train_txt_path.open("a", encoding="utf-8") as f:
         for seg_path, transcript in segment_records:
             cleaned_transcript = transcript.strip()
+            
+            if language.lower() in ["he", "hebrew"]:
+                try:
+                    cleaned_transcript = to_hebrew_ipa(cleaned_transcript)
+                    print(f"DEBUG: Renikud Phonemized -> {cleaned_transcript}")
+                except Exception as e:
+                    print(f"DEBUG: Renikud failed: {e}")
+
             try:
                 seg_number = int(seg_path.stem.replace("seg_", "").replace("seg", ""))
             except ValueError:
